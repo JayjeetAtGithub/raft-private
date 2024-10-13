@@ -20,9 +20,14 @@
 #include <raft/core/device_resources.hpp>
 #include <raft/core/resource/thrust_policy.hpp>
 #include <raft/neighbors/ivf_flat.cuh>
+#include <raft/neighbors/cagra.cuh>
+#include <raft/neighbors/brute_force.cuh>
 #include <raft/util/cudart_utils.hpp>
+#include <raft/stats/neighborhood_recall.cuh>
 
 #include <rmm/mr/device/device_memory_resource.hpp>
+#include <rmm/mr/device/managed_memory_resource.hpp>
+#include <rmm/mr/device/cuda_memory_resource.hpp>
 #include <rmm/mr/device/pool_memory_resource.hpp>
 
 #include <thrust/copy.h>
@@ -31,131 +36,122 @@
 
 #include <cstdint>
 #include <optional>
+#include <chrono>
 
-void ivf_flat_build_search_simple(raft::device_resources const& dev_resources,
-                                  raft::device_matrix_view<const float, int64_t> dataset,
-                                  raft::device_matrix_view<const float, int64_t> queries)
+void ivf_search(raft::device_resources const& res,
+                raft::device_matrix_view<const float, int64_t> dataset,
+                raft::device_matrix_view<const float, int64_t> queries,
+                int64_t n_list,
+                int64_t n_probe,
+                int64_t top_k)
 {
   using namespace raft::neighbors;
+  std::cout << "Performing IVF-FLAT search" << std::endl;
 
+  // Build the IVF-FLAT index
   ivf_flat::index_params index_params;
-  index_params.n_lists                  = 1024;
+  index_params.n_lists                  = n_list;
   index_params.kmeans_trainset_fraction = 0.1;
   index_params.metric                   = raft::distance::DistanceType::L2Expanded;
-
-  std::cout << "Building IVF-Flat index" << std::endl;
-  auto index = ivf_flat::build(dev_resources, index_params, dataset);
-
-  std::cout << "Number of clusters " << index.n_lists() << ", number of vectors added to index "
+  auto s = std::chrono::high_resolution_clock::now();
+  auto index = ivf_flat::build<float, int64_t>(res, index_params, dataset);
+  auto e = std::chrono::high_resolution_clock::now();
+  std::cout
+    << "[TIME] Train and Index: "
+    << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+    << " ms" << std::endl;
+  std::cout << "[INFO] Number of clusters " << index.n_lists() << ", number of vectors added to index "
             << index.size() << std::endl;
 
-  // Create output arrays.
-  int64_t topk      = 10;
+  // Define arrays to hold search output results
   int64_t n_queries = queries.extent(0);
-  auto neighbors    = raft::make_device_matrix<int64_t>(dev_resources, n_queries, topk);
-  auto distances    = raft::make_device_matrix<float>(dev_resources, n_queries, topk);
+  auto neighbors    = raft::make_device_matrix<int64_t>(res, n_queries, top_k);
+  auto distances    = raft::make_device_matrix<float>(res, n_queries, top_k);
 
-  // Set search parameters.
+  // Perform the search operation
   ivf_flat::search_params search_params;
-  search_params.n_probes = 50;
+  search_params.n_probes = n_probe;
+  s = std::chrono::high_resolution_clock::now();
+  ivf_flat::search<float, int64_t>(
+    res, search_params, index, queries, neighbors.view(), distances.view());
+  e = std::chrono::high_resolution_clock::now();
+  std::cout
+      << "[TIME] Search: "
+      << std::chrono::duration_cast<std::chrono::milliseconds>(e - s).count()
+      << " ms" << std::endl;
 
-  // Search K nearest neighbors for each of the queries.
-  ivf_flat::search(
-    dev_resources, search_params, index, queries, neighbors.view(), distances.view());
 
-  // The call to ivf_flat::search is asynchronous. Before accessing the data, sync by calling
-  // raft::resource::sync_stream(dev_resources);
-
-  print_results(dev_resources, neighbors.view(), distances.view());
+  // Brute force search for reference
+  auto reference_neighbors = raft::make_device_matrix<int64_t, int64_t>(res, n_queries, top_k);
+  auto reference_distances = raft::make_device_matrix<float, int64_t>(res, n_queries, top_k); 
+  auto bfknn_index = raft::neighbors::brute_force::build(res, dataset);
+  raft::neighbors::brute_force::search(res,
+                                     bfknn_index,
+                                     queries,
+                                     reference_neighbors.view(),
+                                     reference_distances.view());
+  float const recall_scalar = 0.0;
+  auto recall_value = raft::make_host_scalar(recall_scalar);
+  raft::stats::neighborhood_recall(res,
+                                  raft::make_const_mdspan(neighbors.view()),
+                                  raft::make_const_mdspan(reference_neighbors.view()),
+                                  recall_value.view());
+  res.sync_stream();
+  std::cout << "Recall@" << top_k << ": " << recall_value(0) << std::endl;
 }
 
-void ivf_flat_build_extend_search(raft::device_resources const& dev_resources,
-                                  raft::device_matrix_view<const float, int64_t> dataset,
-                                  raft::device_matrix_view<const float, int64_t> queries)
+int main(int argc, char **argv)
 {
-  using namespace raft::neighbors;
+  if (argc != 5) {
+    std::cout << argv[0] << "<n_learn> <n_probe> <algo> <mem_type>" << std::endl;
+    exit(1);
+  }
 
-  // Define dataset indices.
-  auto data_indices = raft::make_device_vector<int64_t, int64_t>(dev_resources, dataset.extent(0));
-  thrust::counting_iterator<int64_t> first(0);
-  thrust::device_ptr<int64_t> ptr(data_indices.data_handle());
-  thrust::copy(
-    raft::resource::get_thrust_policy(dev_resources), first, first + dataset.extent(0), ptr);
+  // Get params from the user
+  int64_t n_samples = std::atoi(argv[1]);
+  int64_t n_probe = std::stoi(argv[2]);
+  std::string algo = argv[3];
+  std::string mem_type = argv[4];
+  int64_t n_dim     = 96;
+  int64_t n_queries = 10'000;
+  int64_t n_list = int64_t(4 * std::sqrt(n_samples));
+  int64_t top_k = 100;
 
-  // Sub-sample the dataset to create a training set.
-  auto trainset =
-    subsample(dev_resources, dataset, raft::make_const_mdspan(data_indices.view()), 0.1);
+  // Set the memory resources
+  raft::device_resources res;
+  if (mem_type == "managed") {
+    rmm::mr::managed_memory_resource managed_mr;
+    rmm::mr::set_current_device_resource(&managed_mr);
+  } else if (mem_type == "cuda") {
+    rmm::mr::cuda_memory_resource cuda_mr;
+    rmm::mr::set_current_device_resource(&cuda_mr);
+  } else if (mem_type == "pool") {
+    rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
+      rmm::mr::get_current_device_resource(), 2 * 1024 * 1024 * 1024ull);
+    rmm::mr::set_current_device_resource(&pool_mr);
+  } else {
+    std::cout << "[INFO] Invalid memory type" << std::endl;
+    exit(1);
+  }
 
-  ivf_flat::index_params index_params;
-  index_params.n_lists           = 100;
-  index_params.metric            = raft::distance::DistanceType::L2Expanded;
-  index_params.add_data_on_build = false;
-
-  std::cout << "\nRun k-means clustering using the training set" << std::endl;
-  auto index =
-    ivf_flat::build(dev_resources, index_params, raft::make_const_mdspan(trainset.view()));
-
-  std::cout << "Number of clusters " << index.n_lists() << ", number of vectors added to index "
-            << index.size() << std::endl;
-
-  std::cout << "Filling index with the dataset vectors" << std::endl;
-  index = ivf_flat::extend(dev_resources,
-                           dataset,
-                           std::make_optional(raft::make_const_mdspan(data_indices.view())),
-                           index);
-
-  std::cout << "Index size after addin dataset vectors " << index.size() << std::endl;
-
-  // Set search parameters.
-  ivf_flat::search_params search_params;
-  search_params.n_probes = 10;
-
-  // Create output arrays.
-  int64_t topk      = 10;
-  int64_t n_queries = queries.extent(0);
-  auto neighbors    = raft::make_device_matrix<int64_t, int64_t>(dev_resources, n_queries, topk);
-  auto distances    = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, topk);
-
-  // Search K nearest neighbors for each queries.
-  ivf_flat::search(
-    dev_resources, search_params, index, queries, neighbors.view(), distances.view());
-
-  // The call to ivf_flat::search is asynchronous. Before accessing the data, sync using:
-  // raft::resource::sync_stream(dev_resources);
-
-  print_results(dev_resources, neighbors.view(), distances.view());
-}
-
-int main()
-{
-  raft::device_resources dev_resources;
-
-  // Set pool memory resource with 1 GiB initial pool size. All allocations use the same pool.
   rmm::mr::pool_memory_resource<rmm::mr::device_memory_resource> pool_mr(
-    rmm::mr::get_current_device_resource(), 1024 * 1024 * 1024ull);
+  rmm::mr::get_current_device_resource(), 50 * 1024 * 1024 * 1024ull);
   rmm::mr::set_current_device_resource(&pool_mr);
 
-  // Alternatively, one could define a pool allocator for temporary arrays (used within RAFT
-  // algorithms). In that case only the internal arrays would use the pool, any other allocation
-  // uses the default RMM memory resource. Here is how to change the workspace memory resource to
-  // a pool with 2 GiB upper limit.
-  // raft::resource::set_workspace_to_pool_resource(dev_resources, 2 * 1024 * 1024 * 1024ull);
-
   // Create input arrays.
-  int64_t n_samples = 10000;
-  int64_t n_dim     = 3;
-  int64_t n_queries = 10;
-  auto dataset      = raft::make_device_matrix<float, int64_t>(dev_resources, n_samples, n_dim);
-  auto queries      = raft::make_device_matrix<float, int64_t>(dev_resources, n_queries, n_dim);
-  generate_dataset(dev_resources, dataset.view(), queries.view());
+  auto dataset      = raft::make_device_matrix<float, int64_t>(res, n_samples, n_dim);
+  auto queries      = raft::make_device_matrix<float, int64_t>(res, n_queries, n_dim);
+  generate_dataset(res, dataset.view(), queries.view());
 
   // Simple build and search example.
-  ivf_flat_build_search_simple(dev_resources,
-                               raft::make_const_mdspan(dataset.view()),
-                               raft::make_const_mdspan(queries.view()));
+  if (algo == "ivf") {
+    ivf_search(res,
+              raft::make_const_mdspan(dataset.view()),
+              raft::make_const_mdspan(queries.view()),
+              n_list,
+              n_probe,
+              top_k);
+  }
 
-  // Build and extend example.
-  ivf_flat_build_extend_search(dev_resources,
-                               raft::make_const_mdspan(dataset.view()),
-                               raft::make_const_mdspan(queries.view()));
+  res.sync_stream();
 }
